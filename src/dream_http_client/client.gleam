@@ -962,7 +962,7 @@ pub type StreamMessage {
   StreamError(request_id: RequestId, reason: String)
   /// The server answered a streaming request with a complete non-2xx response
   /// (httpc only streams 2xx): status, reason phrase, headers, decompressed body.
-  ResponseError(
+  ErrorResponse(
     request_id: RequestId,
     status: Int,
     reason_phrase: String,
@@ -2106,7 +2106,7 @@ fn decode_response_error(
     use body <- result.try(
       decode_text(data, 3) |> result.map_error(fn(_) { "bad body" }),
     )
-    Ok(ResponseError(req_id, status, phrase, tuples_to_headers(headers), body))
+    Ok(ErrorResponse(req_id, status, phrase, tuples_to_headers(headers), body))
   }
   case decoded {
     Ok(message) -> message
@@ -2375,7 +2375,7 @@ fn handle_stream_message(
       }
     }
 
-    ResponseError(stream_req_id, status, reason_phrase, headers, body) -> {
+    ErrorResponse(stream_req_id, status, reason_phrase, headers, body) -> {
       case stream_req_id == req_id {
         True -> {
           case request.on_error_response, request.on_stream_error {
@@ -2633,7 +2633,7 @@ fn record_stream_message(message: StreamMessage) -> Nil {
       }
     }
     // A complete non-2xx response ends the stream; nothing to record.
-    ResponseError(_, _, _, _, _) -> Nil
+    ErrorResponse(_, _, _, _, _) -> Nil
     DecodeError(error_reason) -> {
       // DecodeError indicates a serious FFI problem at the FFI boundary.
       io.println_error(
