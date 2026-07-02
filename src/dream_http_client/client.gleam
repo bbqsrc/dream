@@ -226,6 +226,7 @@ pub opaque type ClientRequest {
     on_stream_chunk: Option(fn(BitArray) -> Nil),
     on_stream_end: Option(fn(List(Header)) -> Nil),
     on_stream_error: Option(fn(String) -> Nil),
+    on_error_response: Option(fn(Int, List(Header), String) -> Nil),
   )
 }
 
@@ -271,6 +272,7 @@ pub fn new() -> ClientRequest {
     on_stream_chunk: None,
     on_stream_end: None,
     on_stream_error: None,
+    on_error_response: None,
   )
 }
 
@@ -668,6 +670,21 @@ pub fn on_stream_error(
   callback: fn(String) -> Nil,
 ) -> ClientRequest {
   ClientRequest(..client_request, on_stream_error: Some(callback))
+}
+
+/// Set a callback for a complete non-2xx error response on a streaming request.
+///
+/// When the server answers with a non-2xx status, httpc does not stream: the whole
+/// response arrives at once. With this callback set you receive it STRUCTURED —
+/// `callback(status, headers, body)` (body already decompressed) — so you can
+/// classify by status and honor headers such as `retry-after`. Without it, the
+/// response is formatted into `on_stream_error` as
+/// `"HTTP <status> <reason-phrase>: <body>"` (the previous behaviour).
+pub fn on_error_response(
+  client_request: ClientRequest,
+  callback: fn(Int, List(Header), String) -> Nil,
+) -> ClientRequest {
+  ClientRequest(..client_request, on_error_response: Some(callback))
 }
 
 /// Add a header to the request
