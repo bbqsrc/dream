@@ -183,9 +183,10 @@ stream_owner_wait(RequestId, Buffer, StartHeaders, StartWaiters, ZlibCtx) ->
         {http, {RequestId, {error, Reason}}} ->
             cleanup_zlib(ZlibCtx),
             stream_owner_wait(RequestId, Buffer ++ [{error, format_error(Reason)}], StartHeaders, StartWaiters, undefined);
-        {http, {RequestId, {{_HttpVersion, StatusCode, ReasonPhrase}, _Headers, Body}}} ->
+        {http, {RequestId, {{_HttpVersion, StatusCode, ReasonPhrase}, Headers, Body}}} ->
             cleanup_zlib(ZlibCtx),
-            ErrorMsg = format_complete_response_error(StatusCode, ReasonPhrase, Body),
+            {DecodedBody, _} = maybe_decompress_response(Body, Headers),
+            ErrorMsg = format_complete_response_error(StatusCode, ReasonPhrase, DecodedBody),
             stream_owner_wait(RequestId, Buffer ++ [{error, ErrorMsg}], StartHeaders, StartWaiters, undefined);
         _Other ->
             stream_owner_wait(RequestId, Buffer, StartHeaders, StartWaiters, ZlibCtx)
@@ -274,9 +275,10 @@ stream_owner_next_message(RequestId, ZlibCtx) ->
         {http, {RequestId, {error, Reason}}} ->
             cleanup_zlib(ZlibCtx),
             {{error, format_error(Reason)}, undefined};
-        {http, {RequestId, {{_HttpVersion, StatusCode, ReasonPhrase}, _Headers, Body}}} ->
+        {http, {RequestId, {{_HttpVersion, StatusCode, ReasonPhrase}, Headers, Body}}} ->
             cleanup_zlib(ZlibCtx),
-            {{error, format_complete_response_error(StatusCode, ReasonPhrase, Body)}, undefined};
+            {DecodedBody, _} = maybe_decompress_response(Body, Headers),
+            {{error, format_complete_response_error(StatusCode, ReasonPhrase, DecodedBody)}, undefined};
         _Other ->
             stream_owner_next_message(RequestId, ZlibCtx)
     end.
@@ -645,10 +647,11 @@ receive_stream_message(TimeoutMs) ->
             StringId = get_or_create_string_id(RequestId),
             cleanup_stream_zlib(StringId),
             {stream_error, RequestId, format_error(Reason)};
-        {http, {RequestId, {{_HttpVersion, StatusCode, ReasonPhrase}, _Headers, Body}}} ->
+        {http, {RequestId, {{_HttpVersion, StatusCode, ReasonPhrase}, Headers, Body}}} ->
             StringId = get_or_create_string_id(RequestId),
             cleanup_stream_zlib(StringId),
-            {stream_error, RequestId, format_complete_response_error(StatusCode, ReasonPhrase, Body)}
+            {DecodedBody, _} = maybe_decompress_response(Body, Headers),
+            {stream_error, RequestId, format_complete_response_error(StatusCode, ReasonPhrase, DecodedBody)}
     after TimeoutMs ->
         timeout
     end.
@@ -720,11 +723,19 @@ decode_stream_message_for_selector({http, InnerMessage}) ->
             cleanup_stream_zlib(StringId),
             remove_ref_mapping(StringId),
             {stream_error, StringId, format_error(Reason)};
-        {HttpcRef, {{_HttpVersion, StatusCode, ReasonPhrase}, _Headers, Body}} ->
+        {HttpcRef, {{_HttpVersion, StatusCode, ReasonPhrase}, Headers, Body}} ->
             StringId = get_or_create_string_id(HttpcRef),
             cleanup_stream_zlib(StringId),
             remove_ref_mapping(StringId),
-            {stream_error, StringId, format_complete_response_error(StatusCode, ReasonPhrase, Body)};
+            %% A complete non-2xx response: decompress the body (we advertise
+            %% Accept-Encoding) and surface it STRUCTURED — status, headers, body —
+            %% so callers can classify by status and honor headers like retry-after.
+            {DecodedBody, CleanedHeaders} = maybe_decompress_response(Body, Headers),
+            {response_error, StringId,
+             {StatusCode,
+              ensure_utf8_binary(ReasonPhrase),
+              normalize_headers(CleanedHeaders),
+              ensure_utf8_binary(DecodedBody)}};
         _ ->
             error(badarg)
     end.

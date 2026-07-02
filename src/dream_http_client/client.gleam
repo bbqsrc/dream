@@ -960,6 +960,15 @@ pub type StreamMessage {
   StreamEnd(request_id: RequestId, headers: List(Header))
   /// Stream failed with error (connection drop, timeout, HTTP error, etc.)
   StreamError(request_id: RequestId, reason: String)
+  /// The server answered a streaming request with a complete non-2xx response
+  /// (httpc only streams 2xx): status, reason phrase, headers, decompressed body.
+  ResponseError(
+    request_id: RequestId,
+    status: Int,
+    reason_phrase: String,
+    headers: List(Header),
+    body: String,
+  )
   /// Failed to decode stream message from Erlang FFI (indicates library bug)
   DecodeError(reason: String)
 }
@@ -1946,6 +1955,7 @@ fn decode_by_tag(
     "chunk" -> decode_chunk(req_id, data_result)
     "stream_end" -> decode_stream_end(req_id, data_result)
     "stream_error" -> decode_stream_error(req_id, data_result)
+    "response_error" -> decode_response_error(req_id, data_result)
     _ ->
       StreamError(req_id, "Internal error: Unknown stream message tag: " <> tag)
   }
@@ -2068,6 +2078,51 @@ fn decode_error_reason(
             Error(_) -> StreamError(req_id, string.inspect(reason_dyn))
           }
         Error(_) -> StreamError(req_id, string.inspect(reason_dyn))
+      }
+  }
+}
+
+fn decode_response_error(
+  req_id: RequestId,
+  data_result: Result(d.Dynamic, List(d.DecodeError)),
+) -> StreamMessage {
+  let decoded = {
+    use data <- result.try(
+      data_result |> result.map_error(fn(_) { "missing response_error data" }),
+    )
+    use status <- result.try(
+      d.run(data, d.at([0], d.int)) |> result.map_error(fn(_) { "bad status" }),
+    )
+    use phrase <- result.try(
+      decode_text(data, 1) |> result.map_error(fn(_) { "bad reason phrase" }),
+    )
+    use headers_dyn <- result.try(
+      d.run(data, d.at([2], d.dynamic))
+      |> result.map_error(fn(_) { "missing headers" }),
+    )
+    use headers <- result.try(
+      decode_headers(headers_dyn) |> result.map_error(fn(_) { "bad headers" }),
+    )
+    use body <- result.try(
+      decode_text(data, 3) |> result.map_error(fn(_) { "bad body" }),
+    )
+    Ok(ResponseError(req_id, status, phrase, tuples_to_headers(headers), body))
+  }
+  case decoded {
+    Ok(message) -> message
+    Error(reason) ->
+      StreamError(req_id, "Failed to decode response_error: " <> reason)
+  }
+}
+
+/// A text field of an Erlang tuple that may arrive as a UTF-8 string or a binary.
+fn decode_text(data: d.Dynamic, index: Int) -> Result(String, Nil) {
+  case d.run(data, d.at([index], d.string)) {
+    Ok(text) -> Ok(text)
+    Error(_) ->
+      case d.run(data, d.at([index], d.bit_array)) {
+        Ok(bytes) -> bit_array.to_string(bytes) |> result.replace_error(Nil)
+        Error(_) -> Error(Nil)
       }
   }
 }
@@ -2320,6 +2375,29 @@ fn handle_stream_message(
       }
     }
 
+    ResponseError(stream_req_id, status, reason_phrase, headers, body) -> {
+      case stream_req_id == req_id {
+        True -> {
+          case request.on_error_response, request.on_stream_error {
+            Some(on_response), _ -> on_response(status, headers, body)
+            None, Some(on_error) ->
+              // Backward compatible: the same string the shim used to format.
+              on_error(
+                "HTTP "
+                <> int.to_string(status)
+                <> " "
+                <> reason_phrase
+                <> ": "
+                <> body,
+              )
+            None, None -> Nil
+          }
+          Nil
+        }
+        False -> process_stream_loop(selector, req_id, request, timeout_ms)
+      }
+    }
+
     DecodeError(reason) -> {
       case request.on_stream_error {
         Some(on_error) -> on_error("DecodeError: " <> reason)
@@ -2554,6 +2632,8 @@ fn record_stream_message(message: StreamMessage) -> Nil {
         option.None -> Nil
       }
     }
+    // A complete non-2xx response ends the stream; nothing to record.
+    ResponseError(_, _, _, _, _) -> Nil
     DecodeError(error_reason) -> {
       // DecodeError indicates a serious FFI problem at the FFI boundary.
       io.println_error(
